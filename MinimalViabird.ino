@@ -20,6 +20,7 @@ int numero_fichier = 0;             // Numéro de la photo depuis l'allumage
 
 void setup() {
   Serial.begin(115200);
+  pinMode(brocheLED, OUTPUT);
   digitalWrite(brocheLED, LOW);
 
   // définition des broches de la caméra pour le modèle AI Thinker - ESP32-CAM
