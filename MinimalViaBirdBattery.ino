@@ -1,17 +1,28 @@
 #include "esp_camera.h"
-#include "FS.h" // SD Card ESP32
-#include "SD_MMC.h" // SD Card ESP32
-#include "soc/soc.h" // Disable brownout problems
-#include "soc/rtc_cntl_reg.h" // Disable brownout problems
+#include "FS.h"
+#include "SD_MMC.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include "driver/rtc_io.h"
-#include "driver/touch_pad.h" // Pour désactiver complètement le touch
+#include "driver/touch_pad.h"
+#include "esp_sleep.h"
 
-#define TOUCH_PIN TOUCH_PAD_NUM6 // GPIO 14 = Touch Pad 6
-#define TOUCH_GPIO 14
-int brocheLED = 12; // "LED de bug" branché à la broche GPIO12.
-const int seuilTactile = 180; // Sensibilité du toucher de l'oiseau sur le perchoir
-int Trigger = 7; // tant qu'un oiseau est dessus il prend X photos par seconde
-bool touchEnabled = false; // État du touch sensor
+// ====================== RÉGLAGES ======================
+#define TOUCH_PIN          TOUCH_PAD_NUM6   // GPIO 14 = Touch Pad 6
+#define TOUCH_GPIO         14
+#define SEUIL_RATIO_PCT    75               // seuil = 75 % de la valeur de repos
+#define SEUIL_DEFAUT       180              // utilisé si la calibration échoue
+#define ENTRE_PHOTOS_S     7                // secondes entre 2 photos tant que l'oiseau est là
+#define INACTIVITE_S       10               // secondes sans contact avant de dormir
+#define FRAMES_ECHAUFFEMENT 3               // images jetées après l'init caméra
+
+const int brocheLED = 12;                   // "LED de bug"
+const int brocheFlash = 4;                  // LED flash (aussi DAT1 de la SD)
+
+// Mémoire RTC : conservée pendant le deep sleep
+RTC_DATA_ATTR int      photoNumber    = 0;
+RTC_DATA_ATTR int      sessionFolder  = -1;   // -1 = pas encore créé
+RTC_DATA_ATTR uint16_t seuilTactile   = 0;    // 0 = pas encore calibré
 
 // Pin definition for CAMERA_MODEL_AI_THINKER
 #define PWDN_GPIO_NUM 32
@@ -32,35 +43,76 @@ bool touchEnabled = false; // État du touch sensor
 #define PCLK_GPIO_NUM 22
 
 camera_config_t config;
-int photoNumber = 0;
-int sessionFolder = 0; // Numéro du dossier de session
-String currentFolderPath = ""; // Chemin du dossier actuel
+bool touchEnabled = false;
+bool cameraReady = false;
+bool cameraChaude = false;
+String currentFolderPath = "";
+unsigned long lastTouchMs = 0;
+unsigned long lastPhotoMs = 0;
+unsigned long lastPrint = 0;
 
-// Activer le touch sensor
+// ====================== TOUCH ======================
 void enableTouch() {
-  // Initialiser le système touch
   touch_pad_init();
   touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_1V);
   touch_pad_config(TOUCH_PIN, 0);
   touchEnabled = true;
-  Serial.println("Touch activé");
+  delay(50); // laisse la mesure se stabiliser
 }
 
-// Désactiver COMPLÈTEMENT le touch sensor
 void disableTouch() {
   if (touchEnabled) {
-    // Désinitialiser complètement le touch
     touch_pad_deinit();
-    
-    // Mettre le GPIO en mode input normal
     pinMode(TOUCH_GPIO, INPUT);
-    
     touchEnabled = false;
-    Serial.println("Touch COMPLÈTEMENT désactivé");
   }
 }
 
-// Initialize the camera
+uint16_t lireTouch() {
+  uint16_t v = 0;
+  touch_pad_read(TOUCH_PIN, &v);
+  return v;
+}
+
+// Lecture filtrée : 3 mesures consécutives sous le seuil
+bool estTouche() {
+  for (int i = 0; i < 3; i++) {
+    if (lireTouch() > seuilTactile) return false;
+    delay(10);
+  }
+  return true;
+}
+
+// Valeur de repos moyenne (le touch doit être activé)
+uint16_t mesurerRepos(bool &stable) {
+  const int N = 20;
+  uint32_t somme = 0;
+  uint16_t mn = 65535, mx = 0;
+  for (int i = 0; i < N; i++) {
+    uint16_t v = lireTouch();
+    somme += v;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    delay(20);
+  }
+  uint16_t moy = somme / N;
+  stable = (moy > 20) && ((mx - mn) <= moy / 5); // dispersion < 20 %
+  return moy;
+}
+
+void calibrerSeuil() {
+  bool stable;
+  uint16_t repos = mesurerRepos(stable);
+  if (stable) {
+    seuilTactile = (uint32_t)repos * SEUIL_RATIO_PCT / 100;
+    Serial.printf("Calibration : repos=%u -> seuil=%u\n", repos, seuilTactile);
+  } else {
+    seuilTactile = SEUIL_DEFAUT;
+    Serial.printf("Calibration instable (repos=%u), seuil par défaut %u\n", repos, seuilTactile);
+  }
+}
+
+// ====================== CAMÉRA ======================
 void configInitCamera() {
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -82,7 +134,7 @@ void configInitCamera() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  
+
   if (psramFound()) {
     config.frame_size = FRAMESIZE_UXGA;
     config.jpeg_quality = 10;
@@ -92,187 +144,218 @@ void configInitCamera() {
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
-  
+
   if (esp_camera_init(&config) != ESP_OK) {
     Serial.println("Camera initialization failed");
     ESP.restart();
   }
+  cameraReady = true;
+  cameraChaude = false;
 }
 
-// Initialize SD card (appelé uniquement pendant la prise de photo)
+// Jette les premières images (mauvaise exposition juste après l'init)
+void echauffementCamera() {
+  for (int i = 0; i < FRAMES_ECHAUFFEMENT; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(100);
+  }
+  cameraChaude = true;
+}
+
+// ====================== SD ======================
 bool initMicroSDCard() {
-  Serial.println("Initializing SD Card...");
-  if (!SD_MMC.begin("/sdcard", true)) { // Mode 1-bit pour éviter conflits
+  if (!SD_MMC.begin("/sdcard", true)) { // mode 1-bit
     Serial.println("SD Card Mount Failed");
     return false;
   }
-  
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
+  if (SD_MMC.cardType() == CARD_NONE) {
     Serial.println("No SD Card detected");
     SD_MMC.end();
     return false;
   }
-  
-  Serial.println("SD Card initialized successfully");
   return true;
 }
 
-// Créer un nouveau dossier de session au démarrage
+// Crée un dossier de session (une seule fois par mise sous tension)
 void createSessionFolder() {
   Serial.println("Création du dossier de session...");
-  
   disableTouch();
   delay(100);
-  
+
   if (!initMicroSDCard()) {
-    Serial.println("Impossible de créer le dossier de session");
     enableTouch();
     return;
   }
-  
-  // Chercher le prochain numéro de dossier disponible
-  sessionFolder = 0;
-  while (true) {
-    String folderPath = "/" + String(sessionFolder);
-    
-    // Vérifier si le dossier existe
-    File testDir = SD_MMC.open(folderPath.c_str());
-    if (!testDir) {
-      // Le dossier n'existe pas, on peut l'utiliser
-      break;
-    }
-    testDir.close();
-    sessionFolder++;
-    
-    // Sécurité : limiter à 9999 dossiers
-    if (sessionFolder > 9999) {
-      Serial.println("Trop de dossiers ! Réinitialisation à 0");
-      sessionFolder = 0;
-      break;
-    }
+
+  int n = 0;
+  while (n <= 9999) {
+    String p = "/" + String(n);
+    File t = SD_MMC.open(p.c_str());
+    if (!t) break;
+    t.close();
+    n++;
   }
-  
-  // Créer le nouveau dossier
-  currentFolderPath = "/" + String(sessionFolder);
-  if (SD_MMC.mkdir(currentFolderPath.c_str())) {
-    Serial.printf("Dossier de session créé : %s\n", currentFolderPath.c_str());
+  if (n > 9999) n = 0;
+
+  String chemin = "/" + String(n);
+  if (SD_MMC.mkdir(chemin.c_str())) {
+    sessionFolder = n;
+    Serial.printf("Dossier de session créé : %s\n", chemin.c_str());
   } else {
     Serial.println("Erreur lors de la création du dossier");
-    currentFolderPath = ""; // Fallback sur la racine
   }
-  
+
   SD_MMC.end();
   delay(200);
   enableTouch();
 }
 
-// Capture and save photo
 void takeSavePhoto() {
-  // 1. Désactiver COMPLÈTEMENT le touch avant d'utiliser la SD
-  Serial.println("=== Début prise de photo ===");
-  disableTouch();
-  delay(100); // Délai important pour stabiliser
-  
-  // 2. Capturer la photo
-  Serial.println("Capture de l'image...");
+  Serial.println("=== Prise de photo ===");
+  disableTouch();   // GPIO14 est aussi CLK de la SD
+  delay(100);
+
+  if (!cameraChaude) echauffementCamera();
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
-    enableTouch(); // Réactiver le touch même en cas d'erreur
+    enableTouch();
     return;
   }
-  Serial.println("Image capturée");
-  
-  // 3. Initialiser la SD
+
   if (!initMicroSDCard()) {
     esp_camera_fb_return(fb);
     enableTouch();
     return;
   }
-  
-  // 4. Sauvegarder la photo
+
   String path = currentFolderPath + "/photo" + String(photoNumber) + ".jpg";
-  Serial.printf("Saving photo to: %s\n", path.c_str());
-  
   File file = SD_MMC.open(path.c_str(), FILE_WRITE);
   if (!file) {
     Serial.println("Failed to open file for writing");
   } else {
     file.write(fb->buf, fb->len);
-    Serial.printf("Photo saved: %s (%d bytes)\n", path.c_str(), fb->len);
     file.close();
+    Serial.printf("Photo saved: %s (%d bytes)\n", path.c_str(), fb->len);
     photoNumber++;
   }
-  
-  // 5. Libérer les ressources
+
   esp_camera_fb_return(fb);
-  Serial.println("Fermeture de la SD...");
-  SD_MMC.end(); // Fermer la SD pour libérer GPIO 14
-  
-  // 6. Délai de stabilisation avant de réactiver le touch
-  delay(200); // Délai plus long pour être sûr
-  
-  // 7. Faire clignoter la LED
+  SD_MMC.end();     // libère GPIO14
+  delay(200);
+
   for (int i = 0; i < 4; i++) {
     digitalWrite(brocheLED, HIGH);
     delay(75);
     digitalWrite(brocheLED, LOW);
     delay(75);
   }
-  
-  // 8. Réactiver le touch
+  digitalWrite(brocheLED, LOW);
+
   enableTouch();
-  Serial.println("=== Photo terminée, touch réactivé ===\n");
 }
 
+// ====================== SOMMEIL ======================
+void goToSleep() {
+  Serial.println("Inactivité -> préparation du deep sleep");
+
+  // 1. Recalibrage du repos (compense la dérive température / humidité)
+  if (!touchEnabled) enableTouch();
+  bool stable;
+  uint16_t repos = mesurerRepos(stable);
+  if (stable && repos > seuilTactile) {
+    seuilTactile = (uint32_t)repos * SEUIL_RATIO_PCT / 100;
+    Serial.printf("Seuil mis à jour : repos=%u -> seuil=%u\n", repos, seuilTactile);
+  }
+
+  // 2. Caméra en veille (PWDN à HIGH, maintenu pendant le sommeil)
+  if (cameraReady) esp_camera_deinit();
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  rtc_gpio_hold_en((gpio_num_t)PWDN_GPIO_NUM);
+
+  // 3. LED éteintes et maintenues
+  pinMode(brocheFlash, OUTPUT);
+  digitalWrite(brocheFlash, LOW);
+  rtc_gpio_hold_en((gpio_num_t)brocheFlash);
+  digitalWrite(brocheLED, LOW);
+  rtc_gpio_hold_en((gpio_num_t)brocheLED);
+
+  // 4. Réveil par touch pad
+  touch_pad_config(TOUCH_PIN, seuilTactile);
+  touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
+  touch_pad_fsm_start();
+  esp_sleep_pd_config(ESP_SLEEP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+  esp_sleep_enable_touchpad_wakeup();
+
+  Serial.println("Deep sleep...");
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+// ====================== SETUP / LOOP ======================
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
   Serial.begin(115200);
-  delay(2000);
-  
+  delay(500);
+
+  // Libère les broches maintenues pendant le sommeil
+  rtc_gpio_hold_dis((gpio_num_t)PWDN_GPIO_NUM);
+  rtc_gpio_hold_dis((gpio_num_t)brocheFlash);
+  rtc_gpio_hold_dis((gpio_num_t)brocheLED);
+
   pinMode(brocheLED, OUTPUT);
   digitalWrite(brocheLED, LOW);
-  
-  Serial.println("Initialisation de la caméra...");
+  pinMode(brocheFlash, OUTPUT);
+  digitalWrite(brocheFlash, LOW);
+
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  bool reveilTactile = (cause == ESP_SLEEP_WAKEUP_TOUCHPAD);
+  Serial.printf("Démarrage (%s)\n", reveilTactile ? "réveil tactile" : "mise sous tension");
+
   configInitCamera();
-  
-  // Créer le dossier de session
-  Serial.println("Création du dossier de session...");
-  createSessionFolder();
-  
-  // Activer le touch après l'initialisation
-  Serial.println("Activation du touch sensor...");
   enableTouch();
-  
-  Serial.println("\n=================================");
-  Serial.printf("Système prêt - Dossier session: %s\n", currentFolderPath.c_str());
-  Serial.println("En attente de toucher...");
-  Serial.println("=================================\n");
+
+  if (!reveilTactile || seuilTactile == 0) {
+    // Première mise sous tension : calibration + nouveau dossier
+    photoNumber = 0;
+    sessionFolder = -1;
+    calibrerSeuil();
+    createSessionFolder();
+  }
+
+  if (sessionFolder >= 0) currentFolderPath = "/" + String(sessionFolder);
+  else currentFolderPath = "";
+
+  Serial.printf("Prêt - dossier : %s, seuil : %u\n", currentFolderPath.c_str(), seuilTactile);
+
+  lastTouchMs = millis();
+  lastPhotoMs = 0;
+
+  // Réveillé par un toucher : première photo immédiate (gérée dans loop)
 }
 
 void loop() {
   if (touchEnabled) {
-    uint16_t touchvalue;
-    touch_pad_read(TOUCH_PIN, &touchvalue);
-    
-    // Debug moins verbeux
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 500) {
-      Serial.print("Touch value: ");
-      Serial.println(touchvalue);
+    if (millis() - lastPrint > 1000) {
+      Serial.printf("Touch: %u (seuil %u)\n", lireTouch(), seuilTactile);
       lastPrint = millis();
     }
-    
-    if (touchvalue <= seuilTactile) {
-      Serial.println("\n>>> Touch détecté ! Prise de photo...");
-      takeSavePhoto();
-      
-      Serial.println("Attente avant prochaine photo...");
-      delay(Trigger * 1000); // Temps à attendre entre deux photos (en secondes)
-      Serial.println("Prêt à reprendre une photo\n");
+
+    if (estTouche()) {
+      lastTouchMs = millis();
+      if (lastPhotoMs == 0 || millis() - lastPhotoMs >= ENTRE_PHOTOS_S * 1000UL) {
+        takeSavePhoto();
+        lastPhotoMs = millis();
+        lastTouchMs = millis();
+      }
+    }
+
+    if (millis() - lastTouchMs > INACTIVITE_S * 1000UL) {
+      goToSleep();
     }
   }
-  
-  delay(50); // Petit délai pour éviter de saturer le Serial
+  delay(50);
 }
